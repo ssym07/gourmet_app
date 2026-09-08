@@ -1,0 +1,19 @@
+import { readFileSync } from 'node:fs'
+import { PGlite } from '@electric-sql/pglite'
+import { beforeAll,afterAll,describe,it,expect } from 'vitest'
+const db=new PGlite()
+const u1='20000000-0000-4000-8000-000000000001',u2='20000000-0000-4000-8000-000000000002',rid='10000000-0000-4000-8000-000000000001'
+async function user(id:string,admin=false){await db.exec(`reset role;set role authenticated;select set_config('request.jwt.claim.sub','${id}',false);select set_config('request.jwt.claims','${JSON.stringify({app_metadata:{role:admin?'admin':'user'}})}',false);`)}
+beforeAll(async()=>{
+ await db.exec(`create role anon;create role authenticated;create schema auth;create schema storage;create table auth.users(id uuid primary key);create function auth.uid() returns uuid language sql stable as $$select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid$$;create function auth.jwt() returns jsonb language sql stable as $$select coalesce(nullif(current_setting('request.jwt.claims',true),''),'{}')::jsonb$$;grant usage on schema auth to anon,authenticated;create table storage.buckets(id text primary key,name text,public boolean,file_size_limit bigint,allowed_mime_types text[]);create table storage.objects(id uuid primary key,bucket_id text);alter table storage.objects enable row level security;`)
+ const sql=readFileSync('supabase/migrations/202609080001_initial.sql','utf8').replace('create extension if not exists pgcrypto;','');await db.exec(sql);await db.exec(`insert into auth.users values('${u1}'),('${u2}');`);await user(u1,true)
+ const payload={id:rid,citySlug:'osaka',area:'梅田',slug:'test',name:'テスト店舗',description:'test',recommendationText:'test',priceMin:500,priceMax:1000,editorialScore:4,coverImageUrl:'https://example.com/a.webp',status:'published',partySizes:[1],occasions:[],genres:['ramen'],attributes:{quiet:1},images:[],placeId:'test-place'};await db.query('select public.save_restaurant($1::jsonb)',[JSON.stringify(payload)]);await user(u1)
+})
+afterAll(async()=>{await db.close()})
+describe('database privacy and atomicity',()=>{
+ it('all application tables enable RLS',async()=>{const {rows}=await db.query<{relname:string}>(`select relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relkind='r' and not c.relrowsecurity`);expect(rows).toHaveLength(0)})
+ it('stores only owned history, denies cross-user reads and writes',async()=>{await user(u1);const h={favorites:[rid],actions:[],visits:[],feedback:[],blocked:[]};await db.query('select public.write_history($1::jsonb)',[JSON.stringify(h)]);await user(u2);expect((await db.query('select * from public.favorites')).rows).toHaveLength(0);expect((await db.query('select * from public.account_history')).rows).toHaveLength(0);await expect(db.exec(`insert into public.favorites(user_id,restaurant_id) values('${u1}','${rid}')`)).rejects.toThrow();await user(u1);expect((await db.query('select * from public.favorites')).rows).toHaveLength(1)})
+ it('rolls back invalid feedback instead of partly replacing history',async()=>{await user(u1);await expect(db.query('select public.write_history($1::jsonb)',[JSON.stringify({favorites:[],actions:[],visits:[],feedback:[{visitId:u2,satisfaction:5}],blocked:[]})])).rejects.toThrow();expect((await db.query('select * from public.favorites')).rows).toHaveLength(1)})
+ it('rejects management calls by ordinary users',async()=>{await user(u2);await expect(db.query('select public.save_restaurant($1::jsonb)',[JSON.stringify({id:rid})])).rejects.toThrow('admin required')})
+ it('anonymous visitors see published restaurants but no private rows',async()=>{await db.exec('reset role;set role anon');expect((await db.query('select * from public.restaurants')).rows).toHaveLength(1);expect((await db.query('select * from public.favorites')).rows).toHaveLength(0);await expect(db.query('select public.read_history()')).rejects.toThrow()})
+})
